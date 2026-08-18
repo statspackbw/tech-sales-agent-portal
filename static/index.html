@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#3E5F71">
+<title>StatsPack Tech Sales Agent Portal</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="icon" href="/logo.png">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar" id="sidebar">
+    <div class="side-profile">
+      <div class="avatar" id="avatar">–</div>
+      <div class="who" id="whoName">…</div>
+      <div class="role" id="whoRole"></div>
+    </div>
+    <nav class="nav" id="nav"></nav>
+    <div class="side-foot">
+      <div class="brand" style="font-size:13px;margin-bottom:6px">
+        <img src="/logo.png" alt="" style="height:20px"
+             onerror="this.remove();document.getElementById('footHat').classList.remove('hidden')">
+        <span class="hat hidden" id="footHat" style="border-bottom-width:14px;border-left-width:8px;border-right-width:8px"></span>
+        <span>StatsPack</span>
+      </div>
+      <span id="verLabel"></span>
+    </div>
+  </aside>
+  <div class="backdrop" id="backdrop"></div>
+
+  <div class="main">
+    <header class="topbar">
+      <button class="burger" id="burger" aria-label="Open menu">☰</button>
+      <h1 id="pageTitle">Dashboard</h1>
+      <span class="spacer"></span>
+      <span class="chip" id="engineChip"></span>
+    </header>
+    <main class="content" id="view">
+      <div class="empty"><strong>Loading…</strong></div>
+    </main>
+  </div>
+</div>
+
+<div id="modalRoot"></div>
+<div id="toasts"></div>
+<script src="/app.js"></script>
+</body>
+</html>

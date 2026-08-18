@@ -1,0 +1,277 @@
+"""
+Database layer for the StatsPack Tech Sales Agent Portal.
+
+Runs on Postgres when DATABASE_URL is set (production / Render + Neon),
+and on a local SQLite file otherwise (development on your machine).
+
+The rest of the application writes plain SQL with '?' placeholders and never
+needs to know which engine is underneath.
+"""
+import os
+import re
+import sqlite3
+import threading
+from decimal import Decimal
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+IS_PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+
+if IS_PG:
+    import psycopg2
+    import psycopg2.extras
+    from psycopg2.pool import ThreadedConnectionPool
+
+SQLITE_PATH = os.environ.get("SQLITE_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "portal.db"))
+
+_pool = None
+_local = threading.local()
+_lock = threading.Lock()
+
+
+# --------------------------------------------------------------------------
+# schema  ({PK} and {MONEY} are substituted per engine)
+# --------------------------------------------------------------------------
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+  id            {PK},
+  name          TEXT NOT NULL,
+  email         TEXT NOT NULL UNIQUE,
+  phone         TEXT NOT NULL DEFAULT '',
+  country       TEXT NOT NULL DEFAULT '',
+  role          TEXT NOT NULL DEFAULT 'agent',
+  status        TEXT NOT NULL DEFAULT 'Active',
+  password_hash TEXT NOT NULL,
+  must_change_pw INTEGER NOT NULL DEFAULT 0,
+  quota_usd     {MONEY} NOT NULL DEFAULT 0,
+  start_date    TEXT NOT NULL DEFAULT '',
+  notes         TEXT NOT NULL DEFAULT '',
+  created_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+  token      TEXT PRIMARY KEY,
+  user_id    INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  ip         TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS clients (
+  id             {PK},
+  agent_id       INTEGER NOT NULL,
+  name           TEXT NOT NULL,
+  contact_person TEXT NOT NULL DEFAULT '',
+  contact_email  TEXT NOT NULL DEFAULT '',
+  contact_phone  TEXT NOT NULL DEFAULT '',
+  country        TEXT NOT NULL DEFAULT '',
+  product        TEXT NOT NULL DEFAULT '',
+  currency       TEXT NOT NULL DEFAULT 'USD',
+  monthly_value  {MONEY} NOT NULL DEFAULT 0,
+  stage          TEXT NOT NULL DEFAULT 'Prospect',
+  won_date       TEXT NOT NULL DEFAULT '',
+  notes          TEXT NOT NULL DEFAULT '',
+  created_at     TEXT NOT NULL,
+  updated_at     TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS payments (
+  id          {PK},
+  client_id   INTEGER NOT NULL,
+  amount      {MONEY} NOT NULL DEFAULT 0,
+  currency    TEXT NOT NULL DEFAULT 'USD',
+  fx_rate     {MONEY} NOT NULL DEFAULT 1,
+  amount_usd  {MONEY} NOT NULL DEFAULT 0,
+  paid_date   TEXT NOT NULL,
+  reference   TEXT NOT NULL DEFAULT '',
+  note        TEXT NOT NULL DEFAULT '',
+  voided      INTEGER NOT NULL DEFAULT 0,
+  recorded_by INTEGER NOT NULL,
+  created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS payouts (
+  id           {PK},
+  agent_id     INTEGER NOT NULL,
+  amount_usd   {MONEY} NOT NULL DEFAULT 0,
+  period_label TEXT NOT NULL DEFAULT '',
+  status       TEXT NOT NULL DEFAULT 'Pending',
+  reference    TEXT NOT NULL DEFAULT '',
+  note         TEXT NOT NULL DEFAULT '',
+  paid_date    TEXT NOT NULL DEFAULT '',
+  created_by   INTEGER NOT NULL,
+  created_at   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS reviews (
+  id         {PK},
+  agent_id   INTEGER NOT NULL,
+  author_id  INTEGER NOT NULL,
+  period     TEXT NOT NULL DEFAULT '',
+  rating     INTEGER NOT NULL DEFAULT 3,
+  body       TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS fx (
+  code       TEXT PRIMARY KEY,
+  rate       {MONEY} NOT NULL DEFAULT 1,
+  label      TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+  skey  TEXT PRIMARY KEY,
+  svalue TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS audit (
+  id         {PK},
+  user_id    INTEGER NOT NULL DEFAULT 0,
+  actor      TEXT NOT NULL DEFAULT '',
+  action     TEXT NOT NULL DEFAULT '',
+  detail     TEXT NOT NULL DEFAULT '',
+  ip         TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_clients_agent   ON clients(agent_id);
+CREATE INDEX IF NOT EXISTS idx_payments_client ON payments(client_id);
+CREATE INDEX IF NOT EXISTS idx_payouts_agent   ON payouts(agent_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_user   ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_reviews_agent   ON reviews(agent_id);
+"""
+
+
+def _schema_sql():
+    if IS_PG:
+        return SCHEMA.replace("{PK}", "SERIAL PRIMARY KEY").replace("{MONEY}", "NUMERIC(18,2)")
+    return SCHEMA.replace("{PK}", "INTEGER PRIMARY KEY AUTOINCREMENT").replace("{MONEY}", "REAL")
+
+
+# --------------------------------------------------------------------------
+# connections
+# --------------------------------------------------------------------------
+def _connect_sqlite():
+    conn = sqlite3.connect(SQLITE_PATH, timeout=20, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=8000")
+    return conn
+
+
+def init_pool():
+    global _pool
+    if IS_PG and _pool is None:
+        with _lock:
+            if _pool is None:
+                url = DATABASE_URL
+                # Neon and most managed providers require TLS
+                if "sslmode=" not in url and "localhost" not in url and "127.0.0.1" not in url:
+                    url += ("&" if "?" in url else "?") + "sslmode=require"
+                _pool = ThreadedConnectionPool(1, 8, url)
+
+
+class _Conn:
+    """Thin wrapper giving both engines the same call surface."""
+
+    def __init__(self, raw):
+        self.raw = raw
+
+    def _prep(self, sql):
+        return sql.replace("?", "%s") if IS_PG else sql
+
+    def _cursor(self):
+        if IS_PG:
+            return self.raw.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        return self.raw.cursor()
+
+    def query(self, sql, params=()):
+        cur = self._cursor()
+        cur.execute(self._prep(sql), params)
+        rows = cur.fetchall()
+        cur.close()
+        return [_clean(r) for r in rows]
+
+    def one(self, sql, params=()):
+        rows = self.query(sql, params)
+        return rows[0] if rows else None
+
+    def execute(self, sql, params=()):
+        cur = self._cursor()
+        cur.execute(self._prep(sql), params)
+        cur.close()
+
+    def insert(self, sql, params=()):
+        """INSERT returning the new row id."""
+        cur = self._cursor()
+        if IS_PG:
+            cur.execute(self._prep(sql) + " RETURNING id", params)
+            row = cur.fetchone()
+            new_id = row["id"] if row else None
+        else:
+            cur.execute(sql, params)
+            new_id = cur.lastrowid
+        cur.close()
+        return new_id
+
+    def commit(self):
+        self.raw.commit()
+
+    def rollback(self):
+        self.raw.rollback()
+
+
+def _clean(row):
+    """Normalise a row into a plain dict with JSON-safe values."""
+    d = dict(row)
+    for k, v in d.items():
+        if isinstance(v, Decimal):
+            d[k] = float(v)
+    return d
+
+
+class connection:
+    """Context manager: `with db.connection() as conn:`"""
+
+    def __enter__(self):
+        if IS_PG:
+            init_pool()
+            self.raw = _pool.getconn()
+            self.conn = _Conn(self.raw)
+        else:
+            if not hasattr(_local, "sqlite"):
+                _local.sqlite = _connect_sqlite()
+            self.raw = _local.sqlite
+            self.conn = _Conn(self.raw)
+        return self.conn
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None:
+                self.raw.commit()
+            else:
+                self.raw.rollback()
+        finally:
+            if IS_PG:
+                _pool.putconn(self.raw)
+        return False
+
+
+def init_db():
+    """Create tables. Safe to run on every boot."""
+    if IS_PG:
+        init_pool()
+    with connection() as conn:
+        sql = _schema_sql()
+        if IS_PG:
+            cur = conn.raw.cursor()
+            cur.execute(sql)
+            cur.close()
+        else:
+            conn.raw.executescript(sql)
+    return "postgres" if IS_PG else "sqlite"
+
+
+def engine_name():
+    return "postgres" if IS_PG else f"sqlite ({SQLITE_PATH})"
